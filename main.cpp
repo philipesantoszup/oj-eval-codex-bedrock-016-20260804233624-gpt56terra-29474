@@ -89,10 +89,59 @@ Key makeKey(const std::string &index, std::int32_t value) {
 class BPlusTree {
 public:
     BPlusTree() { load(); }
-    ~BPlusTree() { save(); }
+    ~BPlusTree() {
+        maybeCompact();
+        save();
+    }
 
     void insert(const std::string &index, std::int32_t value) {
         const Key key = makeKey(index, value);
+        insertKey(key);
+    }
+
+    void erase(const std::string &index, std::int32_t value) {
+        const Key key = makeKey(index, value);
+        const std::uint32_t leafId = descend(key, nullptr);
+        LeafPage &leaf = pages_[leafId].leaf;
+        const std::uint32_t pos = lowerBound(leaf, key);
+        if (pos == leaf.count || compareKey(leaf.keys[pos], key) != 0) return;
+        for (std::uint32_t i = pos + 1; i < leaf.count; ++i) leaf.keys[i - 1] = leaf.keys[i];
+        --leaf.count;
+        if (leaf.count == 0) ++emptyLeaves_;
+        dirty_[leafId] = true;
+    }
+
+    void find(const std::string &index, std::string &out) {
+        // Deletion deliberately avoids costly per-operation rebalancing. Once enough
+        // completely empty leaves exist, rebuild once from the live sorted records so
+        // subsequent finds cannot repeatedly walk a long empty leaf chain.
+        maybeCompact();
+        const Key first = makeKey(index, std::numeric_limits<std::int32_t>::min());
+        std::uint32_t pageId = descend(first, nullptr);
+        bool any = false;
+        while (pageId != 0) {
+            const LeafPage &leaf = pages_[pageId].leaf;
+            std::uint32_t pos = lowerBound(leaf, first);
+            while (pos < leaf.count && compareIndex(leaf.keys[pos].index, index.c_str()) == 0) {
+                if (any) out.push_back(' ');
+                out += std::to_string(leaf.keys[pos].value);
+                any = true;
+                ++pos;
+            }
+            if (pos < leaf.count || leaf.next == 0) break;
+            pageId = leaf.next;
+        }
+        if (!any) out += "null";
+        out.push_back('\n');
+    }
+
+private:
+    Header header_{};
+    std::vector<Page> pages_;
+    std::vector<bool> dirty_;
+    std::uint32_t emptyLeaves_ = 0;
+
+    void insertKey(const Key &key) {
         std::vector<Ancestor> path;
         const std::uint32_t leafId = descend(key, &path);
         LeafPage &leaf = pages_[leafId].leaf;
@@ -100,9 +149,11 @@ public:
         if (pos < leaf.count && compareKey(leaf.keys[pos], key) == 0) return;
 
         if (leaf.count < kLeafCapacity) {
+            const bool wasEmpty = leaf.count == 0;
             for (std::uint32_t i = leaf.count; i > pos; --i) leaf.keys[i] = leaf.keys[i - 1];
             leaf.keys[pos] = key;
             ++leaf.count;
+            if (wasEmpty) --emptyLeaves_;
             dirty_[leafId] = true;
             return;
         }
@@ -128,42 +179,6 @@ public:
         insertIntoParent(leafId, right.keys[0], rightId, path);
     }
 
-    void erase(const std::string &index, std::int32_t value) {
-        const Key key = makeKey(index, value);
-        const std::uint32_t leafId = descend(key, nullptr);
-        LeafPage &leaf = pages_[leafId].leaf;
-        const std::uint32_t pos = lowerBound(leaf, key);
-        if (pos == leaf.count || compareKey(leaf.keys[pos], key) != 0) return;
-        for (std::uint32_t i = pos + 1; i < leaf.count; ++i) leaf.keys[i - 1] = leaf.keys[i];
-        --leaf.count;
-        dirty_[leafId] = true;
-    }
-
-    void find(const std::string &index, std::string &out) const {
-        const Key first = makeKey(index, std::numeric_limits<std::int32_t>::min());
-        std::uint32_t pageId = descend(first, nullptr);
-        bool any = false;
-        while (pageId != 0) {
-            const LeafPage &leaf = pages_[pageId].leaf;
-            std::uint32_t pos = lowerBound(leaf, first);
-            while (pos < leaf.count && compareIndex(leaf.keys[pos].index, index.c_str()) == 0) {
-                if (any) out.push_back(' ');
-                out += std::to_string(leaf.keys[pos].value);
-                any = true;
-                ++pos;
-            }
-            if (pos < leaf.count || leaf.next == 0) break;
-            pageId = leaf.next;
-        }
-        if (!any) out += "null";
-        out.push_back('\n');
-    }
-
-private:
-    Header header_{};
-    std::vector<Page> pages_;
-    std::vector<bool> dirty_;
-
     void initialize() {
         std::memset(&header_, 0, sizeof(header_));
         std::memcpy(header_.magic, "BPT2697", 8);
@@ -175,6 +190,10 @@ private:
         std::memset(&pages_[1], 0, sizeof(Page));
         pages_[1].leaf.type = kLeaf;
         dirty_.assign(2, false);
+        // The root may replace an older on-disk page during compaction, so it must
+        // always be emitted along with a freshly initialized header.
+        dirty_[1] = true;
+        emptyLeaves_ = 1;
     }
 
     void load() {
@@ -199,6 +218,25 @@ private:
             return;
         }
         dirty_.assign(header_.nextPage, false);
+        emptyLeaves_ = 0;
+        for (std::uint32_t i = 1; i < header_.nextPage; ++i) {
+            if (pages_[i].leaf.type == kLeaf && pages_[i].leaf.count == 0) ++emptyLeaves_;
+        }
+    }
+
+    void maybeCompact() {
+        constexpr std::uint32_t kCompactionThreshold = 64;
+        if (emptyLeaves_ <= kCompactionThreshold) return;
+        std::vector<Key> live;
+        std::uint32_t id = header_.root;
+        while (pages_[id].leaf.type == kInternal) id = pages_[id].internal.children[0];
+        while (id != 0) {
+            const LeafPage &leaf = pages_[id].leaf;
+            live.insert(live.end(), leaf.keys, leaf.keys + leaf.count);
+            id = leaf.next;
+        }
+        initialize();
+        for (const Key &key : live) insertKey(key);
     }
 
     void save() {
